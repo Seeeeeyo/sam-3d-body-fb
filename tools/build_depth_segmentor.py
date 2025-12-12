@@ -19,6 +19,13 @@ Usage:
 import numpy as np
 from typing import Optional, Tuple
 
+# Try to import cv2 for morphological operations (optional)
+try:
+    import cv2
+    _CV2_AVAILABLE = True
+except ImportError:
+    _CV2_AVAILABLE = False
+
 
 class DepthBasedSegmentor:
     """
@@ -144,17 +151,13 @@ class DepthBasedSegmentor:
     
     def _refine_mask(self, mask: np.ndarray) -> np.ndarray:
         """Apply morphological operations to refine the mask."""
-        try:
-            import cv2
+        if _CV2_AVAILABLE:
             # Erode to remove noise
             mask = cv2.erode(mask, self._erode_kernel, iterations=1)
             # Dilate to fill holes
             mask = cv2.dilate(mask, self._dilate_kernel, iterations=2)
             # Final erosion to restore approximate size
             mask = cv2.erode(mask, self._erode_kernel, iterations=1)
-        except ImportError:
-            # If cv2 not available, return as-is
-            pass
         return mask
     
     def _bbox_to_mask(

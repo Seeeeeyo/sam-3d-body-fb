@@ -140,9 +140,15 @@ class DirectIntrinsics:
             zed = sl.Camera()
             # ... initialize camera ...
             intrinsics = DirectIntrinsics.from_zed(zed)
+            
+        Note:
+            pyzed.sl is imported inside this method to avoid requiring it as a 
+            hard dependency. Users who don't use Zed cameras don't need to 
+            install the SDK.
         """
+        # Import inside method to keep pyzed as optional dependency
         try:
-            import pyzed.sl as sl
+            import pyzed.sl as sl  # noqa: F401 - verify import works
             
             calibration = zed_camera.get_camera_information().camera_configuration.calibration_parameters
             left_cam = calibration.left_cam

@@ -405,13 +405,21 @@ class MHRHead(nn.Module):
         # Use cached shape/scale if enabled (runtime mode optimization)
         if self._use_cached_shape and self._cached_shape is not None:
             batch_size = pred.shape[0]
-            # Expand cached values to match batch size
+            # Expand cached values to match batch size and transfer to correct device/dtype
             if self._cached_shape.shape[0] == 1:
-                pred_shape = self._cached_shape.expand(batch_size, -1).to(pred)
-                pred_scale = self._cached_scale.expand(batch_size, -1).to(pred)
+                pred_shape = self._cached_shape.expand(batch_size, -1).to(
+                    device=pred.device, dtype=pred.dtype
+                )
+                pred_scale = self._cached_scale.expand(batch_size, -1).to(
+                    device=pred.device, dtype=pred.dtype
+                )
             else:
-                pred_shape = self._cached_shape[:batch_size].to(pred)
-                pred_scale = self._cached_scale[:batch_size].to(pred)
+                pred_shape = self._cached_shape[:batch_size].to(
+                    device=pred.device, dtype=pred.dtype
+                )
+                pred_scale = self._cached_scale[:batch_size].to(
+                    device=pred.device, dtype=pred.dtype
+                )
         
         pred_hand = pred[:, count : count + self.num_hand_comps * 2]
         count += self.num_hand_comps * 2
