@@ -1,7 +1,17 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
+"""
+SAM 3D Body Demo - Single Image Human Mesh Recovery
+
+This demo supports various optimization modes for Jetson deployment:
+- body-only inference (faster, no hand refinement)
+- depth-based segmentation (instead of SAM)
+- direct camera intrinsics (instead of MoGe2 FOV estimation)
+- shape caching (calibration + runtime modes)
+"""
 import argparse
 import os
 from glob import glob
+from typing import Optional, Tuple
 
 import pyrootutils
 
@@ -18,6 +28,19 @@ import torch
 from sam_3d_body import load_sam_3d_body, SAM3DBodyEstimator
 from tools.vis_utils import visualize_sample, visualize_sample_together
 from tqdm import tqdm
+
+
+def parse_camera_intrinsics(intrinsics_str: str) -> Optional[Tuple[float, ...]]:
+    """Parse camera intrinsics from comma-separated string 'fx,fy,cx,cy'."""
+    if not intrinsics_str:
+        return None
+    try:
+        values = [float(v.strip()) for v in intrinsics_str.split(",")]
+        if len(values) != 4:
+            raise ValueError(f"Expected 4 values (fx,fy,cx,cy), got {len(values)}")
+        return tuple(values)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(f"Invalid intrinsics format: {e}")
 
 
 def main(args):
@@ -41,19 +64,48 @@ def main(args):
     )
 
     human_detector, human_segmentor, fov_estimator = None, None, None
+    
+    # Human detector
     if args.detector_name:
         from tools.build_detector import HumanDetector
 
         human_detector = HumanDetector(
             name=args.detector_name, device=device, path=detector_path
         )
-    if len(segmentor_path):
+    
+    # Human segmentor - support depth-based for Jetson optimization
+    if args.segmentor_name == "depth":
+        # Use lightweight depth-based segmentation
+        from tools.build_depth_segmentor import DepthBasedSegmentor
+        
+        human_segmentor = DepthBasedSegmentor(
+            depth_threshold_min=args.depth_min,
+            depth_threshold_max=args.depth_max,
+            device=device,
+        )
+        print("Using depth-based segmentation (lightweight mode)")
+    elif len(segmentor_path):
         from tools.build_sam import HumanSegmentor
 
         human_segmentor = HumanSegmentor(
             name=args.segmentor_name, device=device, path=segmentor_path
         )
-    if args.fov_name:
+    
+    # FOV estimator - support direct intrinsics for Jetson optimization
+    camera_intrinsics = parse_camera_intrinsics(args.camera_intrinsics)
+    if camera_intrinsics is not None:
+        # Use direct camera intrinsics (bypasses heavy MoGe2 model)
+        from tools.build_fov_estimator import FOVEstimator
+        
+        fov_estimator = FOVEstimator(
+            name="direct",
+            device=device,
+            intrinsics=camera_intrinsics,
+        )
+        print(f"Using direct camera intrinsics: fx={camera_intrinsics[0]:.1f}, "
+              f"fy={camera_intrinsics[1]:.1f}, cx={camera_intrinsics[2]:.1f}, "
+              f"cy={camera_intrinsics[3]:.1f}")
+    elif args.fov_name:
         from tools.build_fov_estimator import FOVEstimator
 
         fov_estimator = FOVEstimator(name=args.fov_name, device=device, path=fov_path)
@@ -83,11 +135,53 @@ def main(args):
         ]
     )
 
+    # Calibration mode: run first frame to cache shape parameters
+    cached_shape = False
+    if args.calibration_mode and len(images_list) > 0:
+        print("\n=== CALIBRATION MODE ===")
+        print("Running calibration on first image to cache shape parameters...")
+        
+        calibration_outputs = estimator.process_one_image(
+            images_list[0],
+            bbox_thr=args.bbox_thresh,
+            use_mask=args.use_mask,
+            inference_type="full",  # Full inference for calibration
+        )
+        
+        if calibration_outputs:
+            # Cache shape and scale from calibration
+            shape_params = torch.tensor(
+                [out["shape_params"] for out in calibration_outputs],
+                device=device,
+            )
+            scale_params = torch.tensor(
+                [out["scale_params"] for out in calibration_outputs],
+                device=device,
+            )
+            
+            # Set cached parameters in the model
+            estimator.model.head_pose.set_cached_shape(shape_params, scale_params)
+            estimator.model.head_pose.enable_shape_cache(True)
+            
+            print(f"Shape cached from {len(calibration_outputs)} person(s)")
+            print("Subsequent frames will use cached shape for faster inference\n")
+            cached_shape = True
+    
+    # Determine inference type
+    inference_type = args.inference_type
+    if inference_type == "auto":
+        inference_type = "full"  # Default to full
+    
+    print(f"Inference type: {inference_type}")
+    if cached_shape:
+        print("Using cached shape parameters (runtime mode)")
+
     for image_path in tqdm(images_list):
         outputs = estimator.process_one_image(
             image_path,
             bbox_thr=args.bbox_thresh,
             use_mask=args.use_mask,
+            inference_type=inference_type,
         )
 
         img = cv2.imread(image_path)
@@ -103,15 +197,28 @@ if __name__ == "__main__":
         description="SAM 3D Body Demo - Single Image Human Mesh Recovery",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-                Examples:
-                python demo.py --image_folder ./images --checkpoint_path ./checkpoints/model.ckpt
+Examples:
+  # Standard demo
+  python demo.py --image_folder ./images --checkpoint_path ./checkpoints/model.ckpt
 
-                Environment Variables:
-                SAM3D_MHR_PATH: Path to MHR asset
-                SAM3D_DETECTOR_PATH: Path to human detection model folder
-                SAM3D_SEGMENTOR_PATH: Path to human segmentation model folder
-                SAM3D_FOV_PATH: Path to fov estimation model folder
-                """,
+  # Jetson-optimized: body-only with direct camera intrinsics
+  python demo.py --image_folder ./images --checkpoint_path ./model.ckpt \\
+      --inference_type body --camera_intrinsics "1000,1000,640,360" --fov_name ""
+
+  # Jetson-optimized: with calibration mode for shape caching
+  python demo.py --image_folder ./images --checkpoint_path ./model.ckpt \\
+      --calibration_mode --inference_type body
+
+  # Depth-based segmentation (requires depth images)
+  python demo.py --image_folder ./images --checkpoint_path ./model.ckpt \\
+      --segmentor_name depth --depth_min 0.5 --depth_max 3.0
+
+Environment Variables:
+  SAM3D_MHR_PATH: Path to MHR asset
+  SAM3D_DETECTOR_PATH: Path to human detection model folder
+  SAM3D_SEGMENTOR_PATH: Path to human segmentation model folder
+  SAM3D_FOV_PATH: Path to fov estimation model folder
+        """,
     )
     parser.add_argument(
         "--image_folder",
@@ -141,13 +248,13 @@ if __name__ == "__main__":
         "--segmentor_name",
         default="sam2",
         type=str,
-        help="Human segmentation model for demo (Default `sam2`, add your favorite segmentor if needed).",
+        help="Human segmentation model: 'sam2' (default) or 'depth' for lightweight depth-based.",
     )
     parser.add_argument(
         "--fov_name",
         default="moge2",
         type=str,
-        help="FOV estimation model for demo (Default `moge2`, add your favorite fov estimator if needed).",
+        help="FOV estimation model: 'moge2' (default) or '' to disable (use --camera_intrinsics instead).",
     )
     parser.add_argument(
         "--detector_path",
@@ -184,6 +291,38 @@ if __name__ == "__main__":
         action="store_true",
         default=False,
         help="Use mask-conditioned prediction (segmentation mask is automatically generated from bbox)",
+    )
+    # Jetson optimization arguments
+    parser.add_argument(
+        "--inference_type",
+        default="full",
+        type=str,
+        choices=["full", "body", "hand", "auto"],
+        help="Inference type: 'full' (body + hand refinement), 'body' (faster, no hand), 'hand' (hand only)",
+    )
+    parser.add_argument(
+        "--calibration_mode",
+        action="store_true",
+        default=False,
+        help="Enable calibration mode: use first frame to cache shape, then use cached shape for runtime",
+    )
+    parser.add_argument(
+        "--camera_intrinsics",
+        default="",
+        type=str,
+        help="Direct camera intrinsics as 'fx,fy,cx,cy' (bypasses MoGe2 FOV estimation for speed)",
+    )
+    parser.add_argument(
+        "--depth_min",
+        default=0.3,
+        type=float,
+        help="Minimum depth threshold in meters for depth-based segmentation",
+    )
+    parser.add_argument(
+        "--depth_max",
+        default=4.0,
+        type=float,
+        help="Maximum depth threshold in meters for depth-based segmentation",
     )
     args = parser.parse_args()
 
